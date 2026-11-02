@@ -188,7 +188,9 @@ for (const sql of [
   'ALTER TABLE matches ADD COLUMN team1_wins INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE matches ADD COLUMN team2_wins INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE tournaments ADD COLUMN best_of INTEGER NOT NULL DEFAULT 1',
-  'ALTER TABLE match_reports ADD COLUMN game_number INTEGER NOT NULL DEFAULT 1'
+  'ALTER TABLE match_reports ADD COLUMN game_number INTEGER NOT NULL DEFAULT 1',
+  'ALTER TABLE teams ADD COLUMN logo_path TEXT',
+  'ALTER TABLE teams ADD COLUMN role_id TEXT'
 ]) {
   try { db.exec(sql); } catch (error) {
     if (!/duplicate column name/i.test(String(error))) throw error; // only "already added" is fine; anything else is a real problem

@@ -33,6 +33,8 @@ export function requireGuild(i: Interaction): string {
 
 export async function replyError(i: RepliableInteraction, error: unknown): Promise<void> {
   const message = error instanceof UserError ? error.message : 'Something went wrong. Try again in a moment.';
+  // 10062 = Discord's 3-second window passed (e.g. the bot was still starting); there's nothing left to reply to.
+  if ((error as { code?: number })?.code === 10062) { console.warn(`[interaction] expired before I could answer (/${'commandName' in i ? i.commandName : '?'})`); return; }
   if (!(error instanceof UserError)) console.error(error);
   const payload = { embeds: [notice('Error', message, Colors.danger)], flags: EPHEMERAL } as const;
   try {

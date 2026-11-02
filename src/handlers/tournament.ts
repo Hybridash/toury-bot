@@ -1,13 +1,12 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, type ButtonInteraction, type ChatInputCommandInteraction } from 'discord.js';
+import { EmbedBuilder, type ButtonInteraction, type ChatInputCommandInteraction } from 'discord.js';
 import { Colors, EPHEMERAL, UserError, notice, plural, requireGuild } from '../util.js';
 import { getMatchView, openMatchesForTeam } from '../services/bracket.js';
 import { listGames, recordGameWin, winsNeeded } from '../services/series.js';
 import { listArenas, whitelistFor } from '../services/arenas.js';
 import { createGameReport, getReport, setReportStatus } from '../services/reports.js';
-import { assertTeamNotBanned } from '../services/bans.js';
-import { getTeamById, requireCaptain, requireOwnTeam } from '../services/teams.js';
+import { getTeamById, requireOwnTeam } from '../services/teams.js';
 import {
-  STATUS_LABEL, confirmedCount, listRegistrations, listTournaments, requireTournament, signUp, withdraw, type Tournament
+  STATUS_LABEL, confirmedCount, listRegistrations, listTournaments, requireTournament, type Tournament
 } from '../services/tournaments.js';
 import { announceChampionIfDone, bracketEmbeds, logEvent, notifyReadyMatches, staffCheck } from './shared.js';
 
@@ -49,7 +48,6 @@ export async function tournamentCommand(i: ChatInputCommandInteraction): Promise
         value: (confirmed.map((r, n) => `${r.seed ?? n + 1}. **${r.teamName}** — ${plural(r.rosterSize, 'player')}`).join('\n') || 'No teams yet.').slice(0, 1024)
       });
     if (pending.length) embed.addFields({ name: `Waiting for approval (${pending.length})`, value: pending.map(r => `**${r.teamName}**`).join(', ').slice(0, 1024) });
-    if (t.requireApproval && t.status === 'SIGNUPS') embed.setFooter({ text: 'Signups need staff approval.' });
     await i.reply({ embeds: [embed], allowedMentions: { parse: [] } });
     return;
   }
@@ -58,24 +56,6 @@ export async function tournamentCommand(i: ChatInputCommandInteraction): Promise
     if (t.status !== 'RUNNING' && t.status !== 'COMPLETE') throw new UserError(`**${t.name}** hasn’t started yet, so there’s no bracket.`);
     await sendBracket(i, t);
     return;
-  }
-
-  const team = requireCaptain(guildId, i.user.id);
-
-  if (sub === 'signup') {
-    await assertTeamNotBanned(team.id, team.name);
-    const status = signUp(t, team);
-    await logEvent(i.client, 'Tournament signup', `**${team.name}** signed up for **${t.name}**${status === 'PENDING' ? ' (waiting for approval)' : ''}.`);
-    await i.reply({ embeds: [status === 'PENDING'
-      ? notice('Signup sent', `**${team.name}** asked to join **${t.name}**. Staff will approve or deny it soon.`, Colors.warning)
-      : notice('Signed up!', `**${team.name}** is in **${t.name}**. Rosters lock once the bracket starts.`, Colors.success)] });
-    return;
-  }
-
-  if (sub === 'withdraw') {
-    withdraw(t, team);
-    await logEvent(i.client, 'Tournament withdrawal', `**${team.name}** withdrew from **${t.name}**.`, Colors.warning);
-    await i.reply({ embeds: [notice('Withdrawn', `**${team.name}** is no longer signed up for **${t.name}**.`, Colors.muted)] });
   }
 }
 
@@ -138,18 +118,4 @@ export function matchInfoEmbed(guildId: string, matchId: number): EmbedBuilder {
       : `${whitelist.filter(w => w.status === 'GRANTED').length ? `All ${whitelist.length} players whitelisted` : `Access removed for all ${whitelist.length} players`}` });
   }
   return embed;
-}
-
-/** The Sign Up button on a tournament announcement. */
-export async function handleSignupButton(i: ButtonInteraction, rawId: string): Promise<void> {
-  const guildId = requireGuild(i);
-  const t = listTournaments(guildId).find(x => x.id === Number(rawId));
-  if (!t) throw new UserError('That tournament no longer exists.');
-  const team = requireCaptain(guildId, i.user.id);
-  await assertTeamNotBanned(team.id, team.name);
-  const status = signUp(t, team);
-  await logEvent(i.client, 'Tournament signup', `**${team.name}** signed up for **${t.name}**${status === 'PENDING' ? ' (waiting for approval)' : ''}.`);
-  await i.reply({ embeds: [status === 'PENDING'
-    ? notice('Signup sent', `**${team.name}** asked to join **${t.name}**. Staff will approve or deny it soon.`, Colors.warning)
-    : notice('Signed up!', `**${team.name}** is in **${t.name}**. Rosters lock once the bracket starts.`, Colors.success)], flags: EPHEMERAL });
 }

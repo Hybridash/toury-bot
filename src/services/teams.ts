@@ -1,6 +1,6 @@
 import { db } from '../db.js';
 import { UserError } from '../util.js';
-import { getPlayer, requirePlayer } from './players.js';
+import { getPlayer, offDiscordId, registerPlayer, requirePlayer, updatePlayer, validateMetaUsername, who, type Region } from './players.js';
 
 export interface Team {
   id: number;
@@ -8,6 +8,8 @@ export interface Team {
   name: string;
   captainId: string;
   region: string;
+  logoPath: string | null;
+  roleId: string | null;
   createdAt: string;
 }
 
@@ -28,7 +30,7 @@ export interface TeamInvite {
   status: string;
 }
 
-const TEAM_SELECT = `SELECT t.id, t.guild_id AS guildId, t.name, t.captain_id AS captainId, t.region, t.created_at AS createdAt FROM teams t`;
+const TEAM_SELECT = `SELECT t.id, t.guild_id AS guildId, t.name, t.captain_id AS captainId, t.region, t.logo_path AS logoPath, t.role_id AS roleId, t.created_at AS createdAt FROM teams t`;
 
 export function getTeamById(id: number): Team | undefined {
   return db.prepare(`${TEAM_SELECT} WHERE t.id = ?`).get(id) as Team | undefined;
@@ -73,7 +75,7 @@ export function validateTeamName(input: string): string {
 
 export function requireOwnTeam(guildId: string, userId: string): Team {
   const team = getTeamOfUser(guildId, userId);
-  if (!team) throw new UserError('You’re not on a team. Create one with `/team create` or accept an invite with `/team invites`.');
+  if (!team) throw new UserError('You’re not on a team. Ask staff to create one, or accept an invite with `/team invites`.');
   return team;
 }
 
@@ -108,17 +110,25 @@ function assertNameFree(guildId: string, name: string, exceptTeamId?: number): v
   if (existing && existing.id !== exceptTeamId) throw new UserError(`A team named **${existing.name}** already exists.`);
 }
 
-export function createTeam(guildId: string, captainId: string, rawName: string): Team {
-  const captain = requirePlayer(captainId);
+export function createTeam(guildId: string, captainId: string, rawName: string, region?: string): Team {
+  const teamRegion = region ?? requirePlayer(captainId).region;
   const name = validateTeamName(rawName);
   if (getTeamOfUser(guildId, captainId)) throw new UserError('You’re already on a team. Leave it before creating a new one.');
   assertNameFree(guildId, name);
   const id = db.transaction(() => {
-    const result = db.prepare('INSERT INTO teams (guild_id, name, captain_id, region) VALUES (?, ?, ?, ?)').run(guildId, name, captainId, captain.region);
+    const result = db.prepare('INSERT INTO teams (guild_id, name, captain_id, region) VALUES (?, ?, ?, ?)').run(guildId, name, captainId, teamRegion);
     db.prepare('INSERT INTO team_members (team_id, guild_id, user_id) VALUES (?, ?, ?)').run(result.lastInsertRowid, guildId, captainId);
     return Number(result.lastInsertRowid);
   })();
   return getTeamById(id)!;
+}
+
+export function setTeamRole(teamId: number, roleId: string | null): void {
+  db.prepare('UPDATE teams SET role_id = ? WHERE id = ?').run(roleId, teamId);
+}
+
+export function setTeamLogo(teamId: number, logoPath: string): void {
+  db.prepare('UPDATE teams SET logo_path = ? WHERE id = ?').run(logoPath, teamId);
 }
 
 export function renameTeam(team: Team, rawName: string): Team {
@@ -138,8 +148,8 @@ function assertRoomForOneMore(team: Team): void {
 export function createInvite(team: Team, invitedBy: string, userId: string, userMention: string): TeamInvite {
   if (userId === invitedBy) throw new UserError('You can’t invite yourself.');
   assertRosterUnlocked(team);
-  const target = requirePlayer(userId, userMention);
-  if (target.region !== team.region) throw new UserError(`${userMention} is registered in **${target.region}**, but **${team.name}** is a **${team.region}** team.`);
+  const target = getPlayer(userId); // unregistered players give their Meta username when they accept
+  if (target && target.region !== team.region) throw new UserError(`${userMention} is registered in **${target.region}**, but **${team.name}** is a **${team.region}** team.`);
   const theirTeam = getTeamOfUser(team.guildId, userId);
   if (theirTeam) throw new UserError(theirTeam.id === team.id ? `${userMention} is already on your team.` : `${userMention} is already on **${theirTeam.name}**.`);
   assertRoomForOneMore(team);
@@ -184,6 +194,36 @@ export function acceptInvite(inviteId: number, userId: string): Team {
   return team;
 }
 
+/**
+ * Staff put a player straight onto a team (no invite). Without a Discord account the player is stored by
+ * Meta username only: they still get whitelisted, they just can't get DMs, roles or see match channels.
+ */
+export function addPlayerAsStaff(team: Team, rawMeta: string, userId?: string): string {
+  const meta = validateMetaUsername(rawMeta);
+  const id = userId ?? offDiscordId(meta);
+  assertRosterUnlocked(team);
+  const owner = db.prepare('SELECT user_id AS id FROM players WHERE meta_username = ?').get(meta) as { id: string } | undefined;
+  if (owner && owner.id !== id) throw new UserError(`The Meta username **${meta}** already belongs to ${who(owner.id)}.`);
+  const current = getTeamOfUser(team.guildId, id);
+  if (current) throw new UserError(current.id === team.id ? `${who(id)} is already on **${team.name}**.` : `${who(id)} is already on **${current.name}**.`);
+  assertRoomForOneMore(team);
+  db.transaction(() => {
+    if (!getPlayer(id)) registerPlayer(id, meta, team.region as Region, 'UTC');
+    else updatePlayer(id, { metaUsername: meta, region: team.region as Region });
+    db.prepare('INSERT INTO team_members (team_id, guild_id, user_id) VALUES (?, ?, ?)').run(team.id, team.guildId, id);
+  })();
+  return id;
+}
+
+/** Staff take a player (found by Meta username) off a team. Returns their id. */
+export function removePlayerAsStaff(team: Team, meta: string): string {
+  const player = db.prepare('SELECT user_id AS id FROM players WHERE meta_username = ?').get(meta.trim()) as { id: string } | undefined;
+  if (!player || !isMember(team.id, player.id)) throw new UserError(`**${meta}** isn’t on **${team.name}**.`);
+  if (player.id === team.captainId) throw new UserError('That’s the captain. Make someone else captain first.');
+  kickMember(team, player.id);
+  return player.id;
+}
+
 export function declineInvite(inviteId: number, userId: string): TeamInvite {
   const invite = requirePendingInvite(inviteId, userId);
   db.prepare("UPDATE team_invites SET status = 'DECLINED' WHERE id = ?").run(invite.id);
@@ -191,14 +231,14 @@ export function declineInvite(inviteId: number, userId: string): TeamInvite {
 }
 
 export function kickMember(team: Team, userId: string): void {
-  if (userId === team.captainId) throw new UserError('You can’t kick yourself. Use `/team transfer` or `/team disband`.');
+  if (userId === team.captainId) throw new UserError('You can’t kick yourself. Use `/team transfer`.');
   if (!isMember(team.id, userId)) throw new UserError('That player isn’t on your team.');
   assertRosterUnlocked(team);
   db.prepare('DELETE FROM team_members WHERE team_id = ? AND user_id = ?').run(team.id, userId);
 }
 
 export function leaveTeam(team: Team, userId: string): void {
-  if (userId === team.captainId) throw new UserError('Captains can’t leave. Hand off captain with `/team transfer` or use `/team disband`.');
+  if (userId === team.captainId) throw new UserError('Captains can’t leave. Hand off captain with `/team transfer`, or ask staff to disband the team.');
   assertRosterUnlocked(team);
   db.prepare('DELETE FROM team_members WHERE team_id = ? AND user_id = ?').run(team.id, userId);
 }
@@ -223,5 +263,5 @@ export function teamDisplayName(teamId: number | null): string {
 
 export function playerLabel(userId: string): string {
   const player = getPlayer(userId);
-  return player ? `<@${userId}> (${player.metaUsername})` : `<@${userId}>`;
+  return player ? `${who(userId)} (${player.metaUsername})` : who(userId);
 }

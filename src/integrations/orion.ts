@@ -46,9 +46,11 @@ export interface OrionApi {
   setSlot(stationId: string, slot: string, team0: SlotTeam | null, team1: SlotTeam | null): Promise<void>;
   /** Recent "game ended" events on a station, newest first. */
   listGameEnds(stationId: string): Promise<GameEndEvent[]>;
+  /** Gives a fleet role to a player by username; Orion Drift removes it again after `hours`. */
+  grantRole?(fleetId: string, roleId: string, username: string, hours: number): Promise<void>;
 }
 
-// ponytail: separator for several usernames in one whitelist is assumed to be a comma. Change here if Orion Drift uses another.
+// Note: the separator for several usernames in one whitelist is assumed to be a comma. Change here if Orion Drift uses another.
 const WHITELIST_SEPARATOR = ',';
 /** Closed-arena value: a name nobody has, so an arena between matches lets no one in. */
 const NOBODY = 'ares-nobody';
@@ -160,6 +162,10 @@ class HttpOrionApi implements OrionApi {
     }
   }
 
+  async grantRole(fleetId: string, roleId: string, username: string, hours: number): Promise<void> {
+    await this.request('POST', `/v2/fleets/${encodeURIComponent(fleetId)}/user_roles`, { role_id: roleId, username, expires_hours: hours });
+  }
+
   async listGameEnds(stationId: string): Promise<GameEndEvent[]> {
     const result = await this.request<{ items?: Array<{ idx: number; event_data: string; timestamp: string }> }>(
       'GET', `/v2/stations/${encodeURIComponent(stationId)}/server_events?event_type=gamemode_stopped&page_size=50`
@@ -205,6 +211,12 @@ export function orion(): OrionApi {
 /** The station whose gamemode slots are the arenas, from ORION_STATION_ID. */
 export function stationId(): string | undefined {
   return process.env.ORION_STATION_ID || undefined;
+}
+
+/** Fleet role (with fleet:join) every tournament player gets, from ORION_PLAYER_ROLE_ID, and how long it lasts. */
+export function playerRole(): { roleId: string; hours: number } | undefined {
+  const roleId = process.env.ORION_PLAYER_ROLE_ID;
+  return roleId ? { roleId, hours: Number(process.env.ORION_PLAYER_ROLE_HOURS) || 12 } : undefined;
 }
 
 /** The fleet used for bans, from ORION_FLEET_ID. */

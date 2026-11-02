@@ -6,21 +6,7 @@ const regionChoices = [
   { name: 'OCE', value: 'OCE' }
 ];
 
-const profile = new SlashCommandBuilder().setName('profile').setDescription('Your player profile')
-  .addSubcommand(s => s.setName('register').setDescription('Register your profile (required before anything else)')
-    .addStringOption(o => o.setName('meta_username').setDescription('Your Meta username').setRequired(true).setMaxLength(32))
-    .addStringOption(o => o.setName('region').setDescription('Your region').setRequired(true).addChoices(...regionChoices))
-    .addStringOption(o => o.setName('timezone').setDescription('Start typing your city, e.g. Chicago').setRequired(true).setAutocomplete(true)))
-  .addSubcommand(s => s.setName('edit').setDescription('Change your profile')
-    .addStringOption(o => o.setName('meta_username').setDescription('New Meta username').setMaxLength(32))
-    .addStringOption(o => o.setName('region').setDescription('New region').addChoices(...regionChoices))
-    .addStringOption(o => o.setName('timezone').setDescription('New timezone').setAutocomplete(true)))
-  .addSubcommand(s => s.setName('view').setDescription('View a player profile')
-    .addUserOption(o => o.setName('user').setDescription('Player to look up (defaults to you)')));
-
-const team = new SlashCommandBuilder().setName('team').setDescription('Create and manage your team')
-  .addSubcommand(s => s.setName('create').setDescription('Create a team and become its captain')
-    .addStringOption(o => o.setName('name').setDescription('Team name').setRequired(true).setMaxLength(32)))
+const team = new SlashCommandBuilder().setName('team').setDescription('Manage your team')
   .addSubcommand(s => s.setName('invite').setDescription('Captain: invite a player')
     .addUserOption(o => o.setName('player').setDescription('Player to invite').setRequired(true)))
   .addSubcommand(s => s.setName('invites').setDescription('See and answer your team invites'))
@@ -28,20 +14,39 @@ const team = new SlashCommandBuilder().setName('team').setDescription('Create an
     .addUserOption(o => o.setName('player').setDescription('Player to remove').setRequired(true)))
   .addSubcommand(s => s.setName('transfer').setDescription('Captain: make someone else captain')
     .addUserOption(o => o.setName('player').setDescription('New captain').setRequired(true)))
-  .addSubcommand(s => s.setName('rename').setDescription('Captain: rename your team')
-    .addStringOption(o => o.setName('name').setDescription('New team name').setRequired(true).setMaxLength(32)))
   .addSubcommand(s => s.setName('leave').setDescription('Leave your team'))
-  .addSubcommand(s => s.setName('disband').setDescription('Captain: delete your team'))
   .addSubcommand(s => s.setName('info').setDescription('View a team')
     .addStringOption(o => o.setName('team').setDescription('Team name (defaults to yours)').setAutocomplete(true)));
+
+const player = new SlashCommandBuilder().setName('player').setDescription('Your Meta username')
+  .addSubcommand(s => s.setName('edit').setDescription('Set the Meta username you play under (used for arena whitelisting)')
+    .addStringOption(o => o.setName('meta_username').setDescription('Meta (Orion Drift) username').setRequired(true).setMaxLength(32))
+    .addUserOption(o => o.setName('user').setDescription('Captain/staff: edit a teammate’s')));
+
+const teamAdmin = new SlashCommandBuilder().setName('team-admin').setDescription('Staff: create and manage teams')
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .addSubcommand(s => s.setName('create').setDescription('Create a team; the captain can then invite their players')
+    .addUserOption(o => o.setName('captain').setDescription('Captain’s Discord account').setRequired(true))
+    .addStringOption(o => o.setName('name').setDescription('Team name').setRequired(true).setMaxLength(32))
+    .addStringOption(o => o.setName('region').setDescription('Team region').setRequired(true).addChoices(...regionChoices))
+    .addAttachmentOption(o => o.setName('logo').setDescription('Team logo (image)').setRequired(true))
+    .addStringOption(o => o.setName('captain_meta_username').setDescription('Captain’s Meta username (needed for arena whitelisting)').setMaxLength(32)))
+  .addSubcommand(s => s.setName('rename').setDescription('Rename a team')
+    .addStringOption(o => o.setName('team').setDescription('Team').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('name').setDescription('New team name').setRequired(true).setMaxLength(32)))
+  .addSubcommand(s => s.setName('add_player').setDescription('Put a player on a team (they don’t need to be in this Discord)')
+    .addStringOption(o => o.setName('team').setDescription('Team').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('meta_username').setDescription('Their Meta (Orion Drift) username — used for the arena whitelist').setRequired(true).setMaxLength(32))
+    .addUserOption(o => o.setName('user').setDescription('Their Discord account, if they have one (for DMs, roles and the match channel)')))
+  .addSubcommand(s => s.setName('remove_player').setDescription('Take a player off a team')
+    .addStringOption(o => o.setName('team').setDescription('Team').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('username').setDescription('Their Meta username').setRequired(true).setAutocomplete(true)))
+  .addSubcommand(s => s.setName('disband').setDescription('Delete a team')
+    .addStringOption(o => o.setName('team').setDescription('Team').setRequired(true).setAutocomplete(true)));
 
 const tournament = new SlashCommandBuilder().setName('tournament').setDescription('Tournaments')
   .addSubcommand(s => s.setName('list').setDescription('List tournaments'))
   .addSubcommand(s => s.setName('info').setDescription('Tournament details and teams')
-    .addStringOption(o => o.setName('tournament').setDescription('Tournament').setRequired(true).setAutocomplete(true)))
-  .addSubcommand(s => s.setName('signup').setDescription('Captain: sign your team up')
-    .addStringOption(o => o.setName('tournament').setDescription('Tournament').setRequired(true).setAutocomplete(true)))
-  .addSubcommand(s => s.setName('withdraw').setDescription('Captain: take your team out before it starts')
     .addStringOption(o => o.setName('tournament').setDescription('Tournament').setRequired(true).setAutocomplete(true)))
   .addSubcommand(s => s.setName('bracket').setDescription('Show the bracket')
     .addStringOption(o => o.setName('tournament').setDescription('Tournament').setRequired(true).setAutocomplete(true)));
@@ -63,12 +68,8 @@ const admin = new SlashCommandBuilder().setName('tournament-admin').setDescripti
     .addIntegerOption(o => o.setName('max_roster').setDescription('Max players per team').setRequired(true).setMinValue(1).setMaxValue(25))
     .addIntegerOption(o => o.setName('best_of').setDescription('Games per match (default: best of 3, first to 2)').addChoices(
       { name: 'Best of 1', value: 1 }, { name: 'Best of 3', value: 3 }, { name: 'Best of 5', value: 5 }, { name: 'Best of 7', value: 7 }))
-    .addBooleanOption(o => o.setName('require_approval').setDescription('Staff must approve each signup (default: no)'))
     .addIntegerOption(o => o.setName('starts_in_minutes').setDescription('Planned start, for reminders (e.g. 90 = in an hour and a half)').setMinValue(5).setMaxValue(43200)))
-  .addSubcommand(s => s.setName('approve').setDescription('Approve a pending signup')
-    .addStringOption(o => o.setName('tournament').setDescription('Tournament').setRequired(true).setAutocomplete(true))
-    .addStringOption(o => o.setName('team').setDescription('Team').setRequired(true).setAutocomplete(true)))
-  .addSubcommand(s => s.setName('add').setDescription('Bring a team in (e.g. to replace one that failed the ready check)')
+  .addSubcommand(s => s.setName('add').setDescription('Put a team into a tournament')
     .addStringOption(o => o.setName('tournament').setDescription('Tournament').setRequired(true).setAutocomplete(true))
     .addStringOption(o => o.setName('team').setDescription('Team').setRequired(true).setAutocomplete(true)))
   .addSubcommand(s => s.setName('disqualify').setDescription('Remove a team from a running tournament; their opponents advance')
@@ -146,9 +147,14 @@ const settings = new SlashCommandBuilder().setName('settings').setDescription('A
     .addRoleOption(o => o.setName('role').setDescription('Role whose members count as tournament staff')))
   .addSubcommand(s => s.setName('log_channel').setDescription('Set where staff alerts and logs go (leave empty to clear)')
     .addChannelOption(o => o.setName('channel').setDescription('Staff log channel').addChannelTypes(ChannelType.GuildText)))
-  .addSubcommand(s => s.setName('thread_channel').setDescription('Set the channel match threads are created in (leave empty to clear)')
-    .addChannelOption(o => o.setName('channel').setDescription('Channel for match threads').addChannelTypes(ChannelType.GuildText)));
+  .addSubcommand(s => s.setName('bracket_channel').setDescription('Where the live bracket, scores and results are posted (leave empty to clear)')
+    .addChannelOption(o => o.setName('channel').setDescription('Bracket channel').addChannelTypes(ChannelType.GuildText)))
+  .addSubcommand(s => s.setName('match_category').setDescription('Category the private match channels are made in (leave empty to clear)')
+    .addChannelOption(o => o.setName('channel').setDescription('Category').addChannelTypes(ChannelType.GuildCategory)))
+  .addSubcommand(s => s.setName('casters').setDescription('DM everyone with a caster role the matchups, arenas and times (leave empty to clear)')
+    .addRoleOption(o => o.setName('role').setDescription('Caster role'))
+    .addChannelOption(o => o.setName('channel').setDescription('Optional: also ping the role in this channel').addChannelTypes(ChannelType.GuildText)));
 
 const help = new SlashCommandBuilder().setName('help').setDescription('How to use the tournament bot');
 
-export const commands = [profile, team, tournament, match, admin, ban, unban, banlist, arena, settings, help].map(command => command.toJSON());
+export const commands = [team, player, teamAdmin, tournament, match, admin, ban, unban, banlist, arena, settings, help].map(command => command.toJSON());

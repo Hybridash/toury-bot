@@ -42,6 +42,15 @@ export function localTime(timezone: string, date = new Date()): string {
   return new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(date);
 }
 
+/** Players staff add by Meta username only (not in the Discord) get a stand-in id like "meta:name". */
+export const offDiscordId = (metaUsername: string): string => `meta:${metaUsername.toLowerCase()}`;
+export const onDiscord = (userId: string): boolean => !userId.startsWith('meta:');
+
+/** A mention for Discord players, the Meta username for everyone else. */
+export function who(userId: string): string {
+  return onDiscord(userId) ? `<@${userId}>` : `**${getPlayer(userId)?.metaUsername ?? userId.slice(5)}** (no Discord)`;
+}
+
 const SELECT = `SELECT user_id AS userId, meta_username AS metaUsername, region, timezone, created_at AS createdAt, updated_at AS updatedAt FROM players`;
 
 export function getPlayer(userId: string): Player | undefined {
@@ -52,8 +61,8 @@ export function requirePlayer(userId: string, otherMention?: string): Player {
   const player = getPlayer(userId);
   if (!player) {
     throw new UserError(otherMention
-      ? `${otherMention} hasn't registered a profile yet. They need to run \`/profile register\` first.`
-      : 'You need to register your profile first with `/profile register`.');
+      ? `${otherMention} isn’t registered yet.`
+      : 'You aren’t registered yet. Accept a team invite to get registered.');
   }
   return player;
 }
@@ -71,7 +80,7 @@ function assertMetaUsernameFree(name: string, userId: string): void {
 }
 
 export function registerPlayer(userId: string, metaUsername: string, region: Region, timezone: string): Player {
-  if (getPlayer(userId)) throw new UserError('You already have a profile. Use `/profile edit` to change it.');
+  if (getPlayer(userId)) throw new UserError('You already have a profile. Use `/player edit` to change it.');
   assertMetaUsernameFree(metaUsername, userId);
   db.prepare('INSERT INTO players (user_id, meta_username, region, timezone) VALUES (?, ?, ?, ?)').run(userId, metaUsername, region, timezone);
   return getPlayer(userId)!;

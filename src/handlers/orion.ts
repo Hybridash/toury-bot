@@ -1,8 +1,8 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from 'discord.js';
+import { EmbedBuilder, type ChatInputCommandInteraction, type Client } from 'discord.js';
 import { Colors, EPHEMERAL, UserError, notice, requireGuild } from '../util.js';
 import { errorText, isActiveBan, mainFleetId, orion, stationId, type OrionBan } from '../integrations/orion.js';
 import {
-  addArena, getArenaByName, listArenas, manualWhitelist, removeArena, seedArenas, setArenaEnabled
+  addArena, getArenaByName, listArenas, lockIdleArenas, manualWhitelist, removeArena, seedArenas, setArenaEnabled
 } from '../services/arenas.js';
 import { logEvent, notifyReadyMatches, requireStaff } from './shared.js';
 
@@ -99,6 +99,13 @@ export async function banlistCommand(i: ChatInputCommandInteraction): Promise<vo
 
 // ---- /arena ------------------------------------------------------------------
 
+/** Closes every arena without a match, and tells staff if any couldn't be closed. */
+export async function lockArenas(client: Client): Promise<void> {
+  const failed = await lockIdleArenas();
+  if (failed.length) await logEvent(client, 'Couldn’t lock arenas', `These arenas without a match couldn’t be set to whitelist-only, so anyone might be able to play in them:\n${failed.map(f => `• ${f}`).join('\n')}\nI’ll try again in 10 minutes.`.slice(0, 4000), Colors.danger);
+}
+
+
 export async function arenaCommand(i: ChatInputCommandInteraction): Promise<void> {
   const guildId = requireGuild(i);
   requireStaff(i);
@@ -116,6 +123,7 @@ export async function arenaCommand(i: ChatInputCommandInteraction): Promise<void
     const added = seedArenas(guildId);
     await logEvent(i.client, 'Arenas added', `<@${i.user.id}> added ${added.length} arenas.`);
     await i.reply({ embeds: [notice('Arenas added', added.length ? added.map(a => `• **${a.name}** → slot \`${a.slot}\``).join('\n') : 'All nine arenas already exist.', Colors.success)], flags: EPHEMERAL });
+    await lockArenas(i.client);
     return;
   }
 
@@ -125,6 +133,7 @@ export async function arenaCommand(i: ChatInputCommandInteraction): Promise<void
     const arena = addArena(guildId, i.options.getString('name', true), station, i.options.getString('slot', true));
     await logEvent(i.client, 'Arena added', `<@${i.user.id}> added arena **${arena.name}** (slot ${arena.slot}).`);
     await i.reply({ embeds: [notice('Arena added', `**${arena.name}** → slot \`${arena.slot}\`. Its whitelist stays closed until a match is given to it.`, Colors.success)], flags: EPHEMERAL });
+    await lockArenas(i.client);
     await notifyReadyMatches(i.client);
     return;
   }

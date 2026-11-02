@@ -1,16 +1,14 @@
 # Ares Tournament Bot
 
-A Discord tournament bot for Orion Drift: player profiles, teams, tournaments with best-of series, automatic arena whitelisting, and bans. It's built with TypeScript, discord.js v14 and SQLite.
+A Discord tournament bot for Orion Drift: staff-created teams, tournaments with best-of series, automatic arena whitelisting, and bans. It's built with TypeScript, discord.js v14 and SQLite.
 
 ## How it works for members
 
-1. **Register first (required).** `/profile register` takes your Meta username, region (NA / EU / OCE) and timezone. The timezone box autocompletes, so start typing your city. Every other member command is blocked until you register.
-2. **Get on a team.**
-   - `/team create name:<anything>` makes a team, and you become its captain 👑. The team's region is the captain's region.
-   - Or a captain invites you, and you accept from the DM buttons or with `/team invites`.
-3. **Captains manage the team** with `/team invite`, `/team kick`, `/team transfer`, `/team rename` and `/team disband`. Players can `/team leave`. Anyone can use `/team info`.
-4. **Enter a tournament.** `/tournament list` shows what's open, and the captain runs `/tournament signup`.
-5. **Play.** When staff start the tournament, everyone does a **ready check**. Once all are ready, the bracket is built and both rosters are whitelisted into their arena (by Meta username), so only those two teams can join. Each match gets a private thread.
+1. **Staff create teams.** `/team-admin create` takes the captain, team name, region and logo. `/team-admin add_player` puts a player straight on a team by Meta username; their Discord account is optional, so **players don't have to be in the server** (they're still whitelisted; they just can't get DMs or see match channels). `/team-admin remove_player` takes one off. Staff enter teams into tournaments with `/tournament-admin add`.
+2. **Get on a team.** The captain invites you with `/team invite`; accept from the DM buttons or `/team invites`. The first time, you're asked for your Meta username.
+3. **Captains manage the team** with `/team invite`, `/team kick` and `/team transfer`. Players can `/team leave`. Anyone can use `/team info`. Staff rename or disband teams with `/team-admin`.
+4. **Enter a tournament.** `/tournament list` shows what's open, and staff add teams with `/tournament-admin add`.
+5. **Play.** When staff start the tournament, everyone does a **ready check** by DM (players who can't be DMed are skipped, but each team needs at least one player who can click). Once all are ready, the bracket is built and both rosters are whitelisted into their arena (by Meta username), so only those two teams can join. Each match gets a **private channel** only those two teams (through their team roles) and staff can see. With an odd number of teams the top seeds get a bye. A team that's through to its next match (it won, or had a bye) gets that match's channel straight away with "waiting for Team A vs Team B to finish", and the opponent is let in when decided. Match channels are deleted when the tournament ends.
 6. **Scores are automatic.** The bot reads each finished game from the arena. In a best of 3, the first team to 2 wins takes the match; the bracket updates, the arena closes, and it goes to the next match. Staff can fix a score with `/tournament-admin game` or `resolve`. `/match info` shows the series score.
 
 ### Rules the bot enforces
@@ -27,7 +25,7 @@ Staff are members with **Manage Server** or **Administrator**, or anyone with th
 | Command | What it does |
 |---|---|
 | `create` | Name, region (NA/EU/OCE/Any), single or double elimination, **best of 1/3/5/7** (default 3), max teams, min/max roster size, and optional approval of each signup |
-| `approve` / `deny` | Accept a pending signup, or deny it / remove a team before the start |
+| `deny` | Remove a team before the start |
 | `close` / `reopen` | Close or reopen signups |
 | `start` | Locks rosters, seeds teams (signup order or `shuffle:true`), builds the bracket and DMs the first matchups |
 | `game` | Records a single game win (for disputed games) |
@@ -45,7 +43,7 @@ An **arena** is an Orion Drift fleet set to **allowlist-only**, plus the fleet r
 
 How it works for each match:
 1. When a match is ready (for example Team 1 vs Team 2), the bot takes a free arena and gives that role to every player on both rosters. It uses their registered Meta username through `POST /v2/fleets/{fleet}/user_roles`.
-2. Captains get a DM with the arena name. Any player who couldn't be whitelisted is listed, for example because their Meta username has no Orion Drift account. Once that player fixes it with `/profile edit`, the bot retries on its own.
+2. Captains get a DM with the arena name. Any player who couldn't be whitelisted is listed, for example because their Meta username has no Orion Drift account. Staff can fix a wrong username in the database; the bot retries on its own.
 3. When the match ends, the bot removes the role from those players (`DELETE /v1/fleets/{fleet}/users/{id}/role/{role}`) and gives the arena to the next waiting match.
 4. If every arena is busy, ready matches wait in line. API errors are retried every minute.
 
@@ -69,7 +67,7 @@ API errors (400/401/403/404/422/429/500) are shown to staff in plain language. R
    - `npm run deploy:commands -- --guild` registers them instantly in the one server set by `DISCORD_GUILD_ID`.
 4. Run `npm run dev`, or `npm run build && npm start`.
 
-The bot only needs the **Guilds** intent. When you invite it, give it the `bot` and `applications.commands` scopes with **Send Messages** and **Embed Links**. The SQLite database is created automatically at `DATABASE_PATH`.
+The bot only needs the **Guilds** intent (plus **Server Members Intent** toggled on in the portal for caster DMs). When you invite it, give it the `bot` and `applications.commands` scopes with **Send Messages**, **Embed Links**, **Manage Roles** and **Manage Channels**. The SQLite database is created automatically at `DATABASE_PATH`.
 
 ## Development
 
@@ -78,7 +76,7 @@ The bot only needs the **Guilds** intent. When you invite it, give it the `bot` 
 
 ```
 src/
-  index.ts            client + interaction router (profile gate lives here)
+  index.ts            client + interaction router 
   commands.ts         slash command definitions
   db.ts               SQLite schema
   services/           players, teams, tournaments, bracket, reports (no Discord code)
@@ -100,7 +98,9 @@ pm2 start dist/index.js --name ares-bot && pm2 save && pm2 startup
 
 **No-show alert.** If no game finishes 15 minutes after an arena opens (`NOSHOW_MINUTES`), staff and the match thread are alerted once.
 
-**Settings.** `/settings staff_role`, `log_channel`, `thread_channel` (admins only). These beat `STAFF_ROLE_ID` / `LOG_CHANNEL_ID` in `.env`.
+**Settings.** `/settings staff_role`, `log_channel`, `bracket_channel` (live bracket, scores, results), `match_category` (where match channels go), `casters` (admins only). These beat `STAFF_ROLE_ID` / `LOG_CHANNEL_ID` in `.env`.
+
+**Casters.** `/settings casters role:@Caster` DMs everyone with that role: an hour before (if `starts_in_minutes` was set) with every team and roster, at the start with all first matches + arenas + byes, and then each match as it starts (round, arena, time, rosters). Add `channel:` to also ping the role there. DMing a role's members needs **Server Members Intent** switched on in the Discord Developer Portal (Bot tab); without it the bot says so in the log channel.
 
 ### Website API (read-only)
 Needs a key in the `x-api-key` header. Make one with `npm run api:key -- website` (add `pii` as a second argument to include Discord IDs and timezones) and put the printed line into `API_KEYS` in `.env` (comma-separate several). The older single `API_KEY` still works and counts as a `pii` key.
@@ -116,7 +116,7 @@ Needs a key in the `x-api-key` header. Make one with `npm run api:key -- website
 Routes: `/health`, `/v1/tournaments`, `/v1/tournaments/:id`, `/v1/tournaments/:id/bracket`, `/v1/matches`, `/v1/matches/:id`, `/v1/teams`, `/v1/teams/:id`, `/v1/players`, `/v1/players/:username`, `/v1/arenas`. Call it from the website's server, never from visitors' browsers.
 
 ### Staff extras
-- `/tournament-admin create … starts_in_minutes:90` posts an announcement with a **Sign Up** button and sends 60- and 10-minute reminders (channel + DM to every signed-up player).
+- `/tournament-admin create … starts_in_minutes:90` posts an announcement and sends 60- and 10-minute reminders (channel + DM to every signed-up player).
 - `/tournament-admin disqualify` removes a team from a running tournament; its current and later matches are forfeited and opponents advance.
 - `/tournament-admin rescore match:<id>` re-reads a live match's arena results and records any missed games (safe to run twice).
 - Banned players (Orion Drift bans in `ORION_FLEET_ID`) can't sign up, and block the ready check until their team is swapped. If Orion Drift is unreachable, nobody is blocked.

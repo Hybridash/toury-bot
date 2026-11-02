@@ -24,6 +24,19 @@ describe('profiles', () => {
   });
 });
 
+describe('staff-created teams', () => {
+  it('lets an unregistered player be invited, give a Meta username, join, and be whitelisted-ready', () => {
+    registerPlayer('sc-cap', 'StaffCap', 'EU', 'UTC');
+    const team = createTeam('G-staff', 'sc-cap', 'Staff Made', 'EU');
+    expect(team.region).toBe('EU');
+    const invite = createInvite(team, 'sc-cap', 'sc-new', '@new');
+    expect(() => acceptInvite(invite.id, 'sc-new')).toThrow(/register/);
+    registerPlayer('sc-new', 'NewGuy', 'EU', 'UTC');
+    acceptInvite(invite.id, 'sc-new');
+    expect(getMembers(team.id).map(m => m.metaUsername)).toEqual(['StaffCap', 'NewGuy']);
+  });
+});
+
 describe('teams', () => {
   it('handles create, invite, accept, decline, kick, leave, transfer, rename, disband', () => {
     registerPlayer('p-b', 'Bravo', 'NA', 'UTC');
@@ -38,7 +51,7 @@ describe('teams', () => {
     expect(() => createTeam(G, 'p-a', 'Second')).toThrow(/already on a team/);
 
     expect(() => createInvite(team, 'p-a', 'p-eu', '@Euro')).toThrow(/EU/);
-    expect(() => createInvite(team, 'p-a', 'unregistered', '@x')).toThrow(/hasn't registered/);
+    expect(() => createInvite(team, 'p-a', 'unregistered', '@x')).not.toThrow(); // unregistered players can be invited; they give a Meta username on accept
 
     const inviteB = createInvite(team, 'p-a', 'p-b', '@Bravo');
     expect(() => acceptInvite(inviteB.id, 'p-c')).toThrow(/isn’t for you/);

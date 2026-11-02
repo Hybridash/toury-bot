@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, type ChatInputCommandInteraction } from 'discord.js';
+import { type ChatInputCommandInteraction } from 'discord.js';
 import { db } from '../db.js';
 import { undoLastGame } from '../services/series.js';
 import { rescoreMatch } from '../services/scoring.js';
@@ -10,7 +10,7 @@ import {
   addTeamAsStaff, createTournament, type Seeding, deleteTournament, disqualifyTeam, getTournamentById, listRegistrations, requireTournament, reviewRegistration, setSignupsOpen, startTournament, withdraw
 } from '../services/tournaments.js';
 import { announceChampionIfDone, announceGame, askConfirm, cleanupTournament, bracketEmbeds, dm, logEvent, notifyReadyMatches, requireStaff } from './shared.js';
-import { beginReadyCheck, cancelReadyCheck } from './start.js';
+import { cancelReadyCheck, forceStart } from './start.js';
 import { tournamentSummary } from './tournament.js';
 
 export async function adminCommand(i: ChatInputCommandInteraction): Promise<void> {
@@ -26,15 +26,14 @@ export async function adminCommand(i: ChatInputCommandInteraction): Promise<void
       maxTeams: i.options.getInteger('max_teams', true),
       minRoster: i.options.getInteger('min_roster', true),
       maxRoster: i.options.getInteger('max_roster', true),
-      requireApproval: i.options.getBoolean('require_approval') ?? false,
+      requireApproval: false,
       bestOf: i.options.getInteger('best_of') ?? 3,
       startsAt: i.options.getInteger('starts_in_minutes') ? Date.now() + i.options.getInteger('starts_in_minutes', true) * 60_000 : undefined
     }, i.user.id);
     db.prepare('UPDATE tournaments SET channel_id = ? WHERE id = ?').run(i.channelId, t.id);
     await logEvent(i.client, 'Tournament created', `<@${i.user.id}> created **${t.name}**.`);
     await i.reply({
-      embeds: [notice(`🏆 ${t.name}`, `${tournamentSummary(getTournamentById(t.id)!)}\n\nSignups are open! Captains: click **Sign Up** (or use \`/tournament signup\`).`, Colors.success)],
-      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(`signup:yes:${t.id}`).setLabel('Sign Up').setStyle(ButtonStyle.Success))]
+      embeds: [notice(`🏆 ${t.name}`, `${tournamentSummary(getTournamentById(t.id)!)}\n\nStaff add teams with \`/tournament-admin add\`.`, Colors.success)]
     });
     return;
   }
@@ -158,10 +157,10 @@ export async function adminCommand(i: ChatInputCommandInteraction): Promise<void
 
   if (sub === 'start') {
     const seeding = (i.options.getString('seed_by') as Seeding | null) ?? (i.options.getBoolean('shuffle') ? 'random' : 'signup');
-    await askConfirm(i, 'Start tournament?', `DM every player of **${t.name}** a ready check? Once every player clicks Ready, rosters lock, the bracket is built${seeding === 'random' ? ' with random seeding' : seeding === 'record' ? ' seeded by past record' : ' in signup order'}, and players are whitelisted into arenas. If anyone can’t be whitelisted, it won’t start.`, async button => {
+    await askConfirm(i, 'Start tournament?', `Start **${t.name}** now? There’s no ready check: rosters lock, the bracket is built${seeding === 'random' ? ' with random seeding' : seeding === 'record' ? ' seeded by past record' : ' in signup order'}, and players are whitelisted into arenas. Anyone who can’t be whitelisted is DMed to fix their Meta username with \`/player edit\`.`, async button => {
       if (!button.channel?.isSendable()) throw new UserError('I can’t post in this channel.');
-      await button.update({ embeds: [notice('Ready check started', `Every player of **${t.name}** is being sent a ready check by DM. Staff alerts go to the log channel.`, Colors.info)], components: [] });
-      await beginReadyCheck(i.client, button.channel, t.id, seeding);
+      await button.update({ embeds: [notice('Starting', `**${t.name}** is starting. Staff alerts go to the log channel.`, Colors.info)], components: [] });
+      await forceStart(i.client, button.channel, t.id, seeding);
     }, 'Start');
     return;
   }

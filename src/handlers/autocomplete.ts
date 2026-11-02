@@ -8,10 +8,7 @@ import { findTournament, listRegistrations, searchTournaments, type TournamentSt
 type Choice = { name: string; value: string };
 
 const tournamentStatusesFor: Record<string, TournamentStatus[] | undefined> = {
-  'tournament:signup': ['SIGNUPS'],
-  'tournament:withdraw': ['SIGNUPS', 'CLOSED'],
   'tournament:bracket': ['RUNNING', 'COMPLETE'],
-  'tournament-admin:approve': ['SIGNUPS', 'CLOSED'],
   'tournament-admin:deny': ['SIGNUPS', 'CLOSED'],
   'tournament-admin:close': ['SIGNUPS'],
   'tournament-admin:reopen': ['CLOSED'],
@@ -33,7 +30,7 @@ export async function handleAutocomplete(i: AutocompleteInteraction): Promise<vo
   } else if (guildId && focused.name === 'team' && i.commandName === 'tournament-admin' && sub !== 'add') {
     const t = findTournament(guildId, i.options.getString('tournament') ?? '');
     if (t) {
-      const wanted = sub === 'approve' ? listRegistrations(t.id, 'PENDING') : listRegistrations(t.id);
+      const wanted = listRegistrations(t.id);
       choices = wanted
         .filter(r => r.teamName.toLowerCase().includes(query.toLowerCase()))
         .map(r => ({ name: `${r.teamName}${r.status === 'PENDING' ? ' (pending)' : ''}`, value: String(r.teamId) }));

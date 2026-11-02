@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, type ButtonInteraction, type ChatInputCommandInteraction } from 'discord.js';
+import { Client, Events, GatewayIntentBits, type ButtonInteraction, type ChatInputCommandInteraction, type ModalSubmitInteraction } from 'discord.js';
 import { config } from './config.js';
 import './db.js';
 import { startApi } from './api.js';
@@ -9,28 +9,22 @@ import { db } from './db.js';
 import { logEvent } from './handlers/shared.js';
 import { EPHEMERAL, UserError, replyError } from './util.js';
 import { staffCheck } from './handlers/shared.js';
-import { requirePlayer } from './services/players.js';
-import { profileCommand } from './handlers/profile.js';
-import { handleInviteButton, teamCommand } from './handlers/team.js';
-import { handleSignupButton, matchCommand, tournamentCommand } from './handlers/tournament.js';
+import { handleInviteButton, handleInviteModal, teamCommand } from './handlers/team.js';
+import { playerCommand } from './handlers/player.js';
+import { teamAdminCommand } from './handlers/teamadmin.js';
+import { matchCommand, tournamentCommand } from './handlers/tournament.js';
 import { adminCommand } from './handlers/admin.js';
 import { settingsCommand } from './handlers/settings.js';
 import { helpCommand } from './handlers/help.js';
-import { arenaCommand, banCommand, banlistCommand, unbanCommand } from './handlers/orion.js';
+import { arenaCommand, banCommand, banlistCommand, lockArenas, unbanCommand } from './handlers/orion.js';
 import { handleAutocomplete } from './handlers/autocomplete.js';
 import { handleReadyButton, restoreReadyChecks } from './handlers/start.js';
 import { handleConfirmButton, handleDisputeButton, guarded, notifyReadyMatches, scoreFinishedGames, sendReminders } from './handlers/shared.js';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-/** Commands members can use before registering. Staff tools are also open so admins don't need a profile. */
-function isOpenCommand(i: ChatInputCommandInteraction): boolean {
-  if (['help', 'tournament-admin', 'ban', 'unban', 'banlist', 'arena', 'settings'].includes(i.commandName)) return true;
-  return i.commandName === 'profile' && i.options.getSubcommand(false) === 'register';
-}
-
 /** Non-staff only ever get private replies; staff replies stay public so everyone sees tournament activity. */
-function makePrivateForMembers(i: ChatInputCommandInteraction | ButtonInteraction): void {
+function makePrivateForMembers(i: ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction): void {
   if (staffCheck(i)) return;
   for (const method of ['reply', 'deferReply', 'followUp'] as const) {
     const original = (i[method] as (o: any) => Promise<unknown>).bind(i);
@@ -42,10 +36,10 @@ async function onCommand(i: ChatInputCommandInteraction): Promise<void> {
   try {
     if (!i.inGuild()) throw new UserError('Use this bot inside a server.');
     makePrivateForMembers(i);
-    if (!isOpenCommand(i)) requirePlayer(i.user.id);
     switch (i.commandName) {
-      case 'profile': return await profileCommand(i);
       case 'team': return await teamCommand(i);
+      case 'player': return await playerCommand(i);
+      case 'team-admin': return await teamAdminCommand(i);
       case 'tournament': return await tournamentCommand(i);
       case 'match': return await matchCommand(i);
       case 'tournament-admin': return await adminCommand(i);
@@ -66,13 +60,19 @@ async function onButton(i: ButtonInteraction): Promise<void> {
     makePrivateForMembers(i);
     const [scope, action, id] = i.customId.split(':');
     if (scope === 'dispute') return await handleDisputeButton(i, id);
-    if (scope === 'signup') return await handleSignupButton(i, id);
     if (scope === 'ready') return await handleReadyButton(i, i.client);
     if (scope === 'confirm') return await handleConfirmButton(i, action, id);
-    if (scope === 'invite') {
-      requirePlayer(i.user.id);
-      return await handleInviteButton(i, action, id);
-    }
+    if (scope === 'invite') return await handleInviteButton(i, action, id);
+  } catch (error) {
+    await replyError(i, error);
+  }
+}
+
+async function onModal(i: ModalSubmitInteraction): Promise<void> {
+  try {
+    makePrivateForMembers(i);
+    const [scope, , id] = i.customId.split(':');
+    if (scope === 'invitemodal') return await handleInviteModal(i, id);
   } catch (error) {
     await replyError(i, error);
   }
@@ -94,12 +94,17 @@ client.once(Events.ClientReady, ready => {
   setInterval(sync, 60_000).unref();
   setInterval(guarded(ready, 'scoring', () => scoreFinishedGames(ready)), 20_000).unref();
   setInterval(guarded(ready, 'reminders', () => sendReminders(ready)), 60_000).unref();
+  // Every arena without a match stays whitelist-only with nobody on it, so only tournament players can play.
+  const lock = guarded(ready, 'arena lock', () => lockArenas(ready));
+  lock();
+  setInterval(lock, 10 * 60_000).unref();
 });
 
 client.on(Events.InteractionCreate, interaction => {
   if (interaction.isChatInputCommand()) void onCommand(interaction);
   else if (interaction.isAutocomplete()) void handleAutocomplete(interaction);
   else if (interaction.isButton()) void onButton(interaction);
+  else if (interaction.isModalSubmit()) void onModal(interaction);
 });
 
 startApi();

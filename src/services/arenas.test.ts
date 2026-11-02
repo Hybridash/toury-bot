@@ -4,8 +4,8 @@ import { setOrionApi, type GameEndEvent, type OrionApi, type SlotTeam } from '..
 import { registerPlayer } from './players.js';
 import { acceptInvite, createInvite, createTeam, type Team } from './teams.js';
 import { addTeamAsStaff, createTournament, rollbackStart, signUp, startTournament, withdraw, type Tournament } from './tournaments.js';
-import { addArena, manualWhitelist, syncArenas, whitelistFor } from './arenas.js';
-import { setSetting, threadChannelId } from './settings.js';
+import { addArena, lockIdleArenas, manualWhitelist, syncArenas, whitelistFor } from './arenas.js';
+import { setSetting, bracketChannelId } from './settings.js';
 import { recordGameWin, seriesState } from './series.js';
 import { pollScores, rescoreMatch } from './scoring.js';
 import { teamHistory, teamRecord } from './stats.js';
@@ -246,11 +246,11 @@ describe('start rollback and staff add', () => {
 
 describe('settings', () => {
   it('saved values beat .env defaults and can be cleared', () => {
-    expect(threadChannelId()).toBeUndefined();
-    setSetting('thread_channel_id', '123');
-    expect(threadChannelId()).toBe('123');
-    setSetting('thread_channel_id', null);
-    expect(threadChannelId()).toBeUndefined();
+    expect(bracketChannelId()).toBeUndefined();
+    setSetting('bracket_channel_id', '123');
+    expect(bracketChannelId()).toBe('123');
+    setSetting('bracket_channel_id', null);
+    expect(bracketChannelId()).toBeUndefined();
   });
 });
 
@@ -388,5 +388,22 @@ describe('slot names', () => {
     expect(normalizeSlot('alpha 03')).toBe('Alpha 03');
     expect(normalizeSlot('  GAMMA   2 ')).toBe('Gamma 02');
     expect(normalizeSlot('Custom Slot')).toBe('Custom Slot');
+  });
+});
+
+describe('idle arenas', () => {
+  it('locks every arena without a match, and leaves a live one alone', async () => {
+    const calls: Array<{ slot: string; open: boolean }> = [];
+    setOrionApi({ findUserId: async () => 'id', banUser: async () => {}, unbanUser: async () => {}, listBans: async () => [], listGameEnds: async () => [],
+      setSlot: async (_s: string, slot: string, a: unknown, b: unknown) => { calls.push({ slot, open: Boolean(a || b) }); } });
+    const guild = 'lock-guild';
+    addArena(guild, 'Lock 1', 'st', 'Delta 01');
+    const busy = addArena(guild, 'Lock 2', 'st', 'Delta 02');
+    db.prepare("INSERT INTO tournaments (guild_id, name, region, format, max_teams, min_roster, max_roster, created_by, status) VALUES (?, 'Lock Cup', 'NA', 'SINGLE', 4, 1, 1, 'x', 'RUNNING')").run(guild);
+    const tid = (db.prepare("SELECT id FROM tournaments WHERE name = 'Lock Cup'").get() as { id: number }).id;
+    db.prepare("INSERT INTO matches (tournament_id, bracket, round, position, status, arena_id) VALUES (?, 'W', 1, 1, 'READY', ?)").run(tid, busy.id);
+    expect(await lockIdleArenas()).toEqual([]);
+    expect(calls.find(c => c.slot === 'Delta 01')).toEqual({ slot: 'Delta 01', open: false });
+    expect(calls.some(c => c.slot === 'Delta 02')).toBe(false); // match in progress: untouched
   });
 });

@@ -1,6 +1,6 @@
 import { db } from '../db.js';
 import { UserError } from '../util.js';
-import { errorText, mainFleetId, orionOrNull, stationId } from '../integrations/orion.js';
+import { errorText, mainFleetId, orionOrNull, playerRole, stationId } from '../integrations/orion.js';
 
 /**
  * Arenas + automatic whitelisting.
@@ -171,7 +171,7 @@ async function applyMatch(matchId: number, arena: Arena): Promise<WhitelistFailu
     const orionUserId = await api.findUserId(player.metaUsername, fleetsToSearch());
     if (!orionUserId) {
       missing.add(player.userId);
-      failures.push(fail(player, 'NOT_FOUND', 'No Orion Drift account with that username', 'no Orion Drift account has that username — fix it with `/profile edit`'));
+      failures.push(fail(player, 'NOT_FOUND', 'No Orion Drift account with that username', 'no Orion Drift account has that username — fix it with `/player edit` (staff: `/team-admin remove_player` + `add_player`)'));
     } else {
       setRow(rows.get(player.userId)!.id, 'PENDING', null, orionUserId);
     }
@@ -184,6 +184,12 @@ async function applyMatch(matchId: number, arena: Arena): Promise<WhitelistFailu
     await api.setSlot(arena.stationId, arena.slot, { name: match.n1, players: names(match.t1) }, { name: match.n2, players: names(match.t2) });
     for (const player of players) if (!missing.has(player.userId)) setRow(rows.get(player.userId)!.id, 'GRANTED', null);
     db.prepare("UPDATE match_whitelist SET status = 'GRANTED', last_error = NULL WHERE match_id = ? AND user_id LIKE 'manual:%'").run(matchId);
+    // Whitelisted players also get the Orion Drift "Tournament Player" fleet role (fleet:join); it expires on its own.
+    const role = playerRole(), fleet = mainFleetId();
+    if (api.grantRole && role && fleet) {
+      const whitelisted = [...players.filter(p => !missing.has(p.userId)).map(p => p.metaUsername), ...manual.map(m => m.metaUsername)];
+      for (const name of whitelisted) await api.grantRole(fleet, role.roleId, name, role.hours).catch(error => console.warn(`[orion] Tournament Player role for ${name}: ${errorText(error)}`));
+    }
   } catch (error) {
     db.prepare("UPDATE match_whitelist SET status = 'ERROR', last_error = ? WHERE match_id = ? AND user_id LIKE 'manual:%'").run(errorText(error), matchId);
     for (const player of players) if (!missing.has(player.userId)) failures.push(fail(player, 'ERROR', errorText(error)));
@@ -273,6 +279,24 @@ async function runSync(): Promise<ReadyEvent[]> {
   await closeStale();
   await retryFailed();
   return assignWaitingMatches();
+}
+
+/**
+ * Locks every arena that isn't hosting a match (whitelist on, nobody on it), so nobody can play in an arena
+ * unless the bot whitelisted them for a tournament match. Runs at startup, when arenas are added, and every
+ * 10 minutes (in case someone opens one by hand). Returns the names of arenas it couldn't lock.
+ */
+export function lockIdleArenas(): Promise<string[]> {
+  return serial(async () => {
+    const api = orionOrNull();
+    if (!api) return [];
+    const failed: string[] = [];
+    for (const arena of db.prepare(ARENA_SELECT).all() as Arena[]) {
+      if (arenaBusy(arena.id)) continue;
+      await api.setSlot(arena.stationId, arena.slot, null, null).catch(error => failed.push(`${arena.name}: ${errorText(error)}`));
+    }
+    return failed;
+  });
 }
 
 let chain: Promise<unknown> = Promise.resolve();

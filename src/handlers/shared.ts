@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, type ButtonInteraction, type ChatInputCommandInteraction, type Client, type EmbedBuilder, type Interaction } from 'discord.js';
-import { config } from '../config.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, type ButtonInteraction, type ChatInputCommandInteraction, type Client, type EmbedBuilder, type Interaction, type SendableChannels } from 'discord.js';
 import { getTournamentById } from '../services/tournaments.js';
 import { Colors, EPHEMERAL, UserError, isStaff, notice } from '../util.js';
 import { getMatchView, listMatchViews, isByeMatch, roundTitle, type MatchView } from '../services/bracket.js';
-import { getTeamById } from '../services/teams.js';
-import { logChannelId, staffRoleId, threadChannelId } from '../services/settings.js';
+import { getMembers, getTeamById } from '../services/teams.js';
+import { casterChannelId, casterRoleId, logChannelId, matchCategoryId, staffRoleId } from '../services/settings.js';
+import { onDiscord, who } from '../services/players.js';
+import { syncTeamRoles } from './roles.js';
 import { pollScores, type ScoredGame } from '../services/scoring.js';
 import { emit } from '../webhooks.js';
 import { markOk } from '../status.js';
@@ -43,6 +44,10 @@ export async function handleConfirmButton(button: ButtonInteraction, action: str
     await button.update({ embeds: [notice('Cancelled', 'Nothing was changed.', Colors.muted)], components: [] });
     return;
   }
+  // Answer the click right away: the work can take longer than Discord's 3 seconds, and may delete the channel
+  // the prompt is in (e.g. deleting a tournament from a match channel), so the final edit is best effort.
+  await button.deferUpdate();
+  button.update = ((options: Parameters<ButtonInteraction['update']>[0]) => button.editReply(options as never).catch(() => null)) as never;
   await pending.run(button);
 }
 
@@ -66,6 +71,7 @@ export async function logEvent(client: Client, title: string, description: strin
 }
 
 export async function dm(client: Client, userId: string, payload: { embeds: EmbedBuilder[]; components?: ActionRowBuilder<ButtonBuilder>[] }): Promise<boolean> {
+  if (!onDiscord(userId)) return false;
   const user = await client.users.fetch(userId).catch(() => null);
   if (!user) return false;
   return user.send(payload).then(() => true).catch(() => false);
@@ -88,40 +94,121 @@ export async function notifyReadyMatches(client: Client): Promise<void> {
   }
   await announceEvents(client, await syncArenas());
   markOk('sync');
+  await openWaitingRooms(client);
   await archiveFinishedThreads(client);
   await refreshBrackets(client);
 }
 
-/** Private thread per match with its arena and both rosters. Needs the tournament's channel (saved when it was started). */
-async function createMatchThread(client: Client, view: MatchView, arenaName: string): Promise<void> {
-  const row = db.prepare('SELECT m.thread_id AS threadId, t.channel_id AS channelId FROM matches m JOIN tournaments t ON t.id = m.tournament_id WHERE m.id = ?')
-    .get(view.id) as { threadId: string | null; channelId: string | null } | undefined;
-  const targetId = threadChannelId() ?? row?.channelId;
-  if (!row || row.threadId || !targetId) return;
-  const channel = await client.channels.fetch(targetId).catch(() => null);
-  if (channel?.type !== ChannelType.GuildText) return;
-  const thread = await channel.threads.create({
-    name: `match-${view.id}-${view.team1_name}-vs-${view.team2_name}`.slice(0, 100), type: ChannelType.PrivateThread, invitable: false
-  }).catch(() => null);
-  if (!thread) return;
-  db.prepare('UPDATE matches SET thread_id = ? WHERE id = ?').run(thread.id, view.id);
-  const userIds = (db.prepare('SELECT user_id FROM team_members WHERE team_id IN (?, ?)').all(view.team1_id, view.team2_id) as Array<{ user_id: string }>).map(r => r.user_id);
-  for (const id of userIds) await thread.members.add(id).catch(() => null);
-  await thread.send({
-    content: userIds.map(id => `<@${id}>`).join(' '),
+// ---- Match channels ----------------------------------------------------------
+
+const MATCH_ACCESS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+const creating = new Set<number>();
+const channelWarned = new Set<number>();
+
+function discordPlayers(...teamIds: Array<number | null>): string[] {
+  return teamIds.flatMap(id => (id === null ? [] : getMembers(id).map(m => m.userId))).filter(onDiscord);
+}
+
+/**
+ * Private channel per match: only the teams in it (through their team role), staff and the bot can see it.
+ * Made as soon as the first team is known (so a team that is through can wait there); the second team is
+ * let in when it arrives. Stored in matches.thread_id.
+ */
+async function ensureMatchChannel(client: Client, view: MatchView): Promise<SendableChannels | null> {
+  const { threadId, channelId } = matchTargets(view.id);
+  const teamIds = [view.team1_id, view.team2_id].filter((id): id is number => id !== null);
+  for (const id of teamIds) await syncTeamRoles(client, id);
+  const roleIds = [...teamIds.map(id => getTeamById(id)?.roleId), staffRoleId()].filter((id): id is string => Boolean(id));
+  const name = `match-${view.id}-${view.team1_name ?? 'tbd'}-vs-${view.team2_name ?? 'tbd'}`.slice(0, 100);
+
+  const existing = threadId ? await client.channels.fetch(threadId).catch(() => null) : null;
+  if (existing?.type === ChannelType.GuildText) {
+    for (const id of roleIds) await existing.permissionOverwrites.edit(id, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true }).catch(() => null);
+    await existing.setName(name).catch(() => null);
+    return existing;
+  }
+  if (existing?.isSendable()) return existing; // a thread from an older version of the bot
+  if (creating.has(view.id)) return null;
+  creating.add(view.id);
+  try {
+    const guild = await client.guilds.fetch(view.guild_id).catch(() => null);
+    if (!guild || !client.user) return null;
+    const home = channelId ? await client.channels.fetch(channelId).catch(() => null) : null;
+    const parent = matchCategoryId() ?? (home && 'parentId' in home ? home.parentId : null);
+    const channel = await guild.channels.create({
+      name, type: ChannelType.GuildText, parent: parent ?? undefined, reason: `Match #${view.id}`,
+      permissionOverwrites: [
+        { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: client.user.id, allow: [...MATCH_ACCESS, PermissionFlagsBits.ManageChannels] },
+        ...roleIds.map(id => ({ id, allow: MATCH_ACCESS }))
+      ]
+    }).catch(error => { console.error('[match channel]', error instanceof Error ? error.message : error); return null; });
+    if (!channel) {
+      if (channelWarned.has(view.id)) return null; // retried every minute; tell staff once
+      channelWarned.add(view.id);
+      await logEvent(client, 'Couldn’t create a match channel', `Match #${view.id}: give the bot **Manage Channels** and **Manage Roles** (and access to the match category).`, Colors.warning);
+      return null;
+    }
+    db.prepare('UPDATE matches SET thread_id = ? WHERE id = ?').run(channel.id, view.id);
+    return channel;
+  } finally {
+    creating.delete(view.id);
+  }
+}
+
+/** The arena is open: let both teams into the match channel and tell them where to play. */
+async function postMatchStart(client: Client, view: MatchView, arenaName: string): Promise<void> {
+  const channel = await ensureMatchChannel(client, view);
+  const offDiscord = [view.team1_id, view.team2_id].flatMap(id => (id === null ? [] : getMembers(id))).filter(m => !onDiscord(m.userId)).map(m => m.metaUsername);
+  await channel?.send({
+    content: discordPlayers(view.team1_id, view.team2_id).map(id => `<@${id}>`).join(' ') || undefined,
     embeds: [notice(`Match #${view.id} — ${view.team1_name} vs ${view.team2_name}`,
-      `🏟️ **Arena: ${arenaName}**\nOnly the players in this thread are whitelisted. ${view.best_of === 1 ? 'One game.' : `Best of ${view.best_of}.`}\nScores are tracked automatically; call staff here if something goes wrong.`, Colors.success)]
+      `🏟️ **Arena: ${arenaName}**\nBoth rosters are whitelisted, so only your two teams can get in. ${view.best_of === 1 ? 'One game.' : `Best of ${view.best_of} (first to ${winsNeeded(view.best_of)}).`}`
+      + `${offDiscord.length ? `\nAlso whitelisted (not on Discord): ${offDiscord.join(', ')}` : ''}\nScores are tracked automatically; call staff here if something goes wrong.`, Colors.success)]
   }).catch(() => null);
 }
 
-export async function announceEvents(client: Client, events: ReadyEvent[]): Promise<void> {
+/** The match that will fill the empty side of `view`, if any. */
+function feederFor(view: MatchView): MatchView | undefined {
+  const slot = view.team1_id === null ? 1 : 2;
+  const row = db.prepare('SELECT id FROM matches WHERE (next_win_id = ? AND next_win_slot = ?) OR (next_lose_id = ? AND next_lose_slot = ?) LIMIT 1')
+    .get(view.id, slot, view.id, slot) as { id: number } | undefined;
+  return row ? getMatchView(row.id) : undefined;
+}
+
+/**
+ * A team is through to its next match (it won, or had a bye) but the opponent isn't known yet:
+ * open the match channel for it now and say which match it is waiting on.
+ */
+export async function openWaitingRooms(client: Client): Promise<void> {
+  const rows = db.prepare(`SELECT m.id FROM matches m JOIN tournaments t ON t.id = m.tournament_id
+    WHERE t.status = 'RUNNING' AND m.status = 'WAITING' AND m.thread_id IS NULL AND (m.team1_id IS NULL) != (m.team2_id IS NULL)`).all() as Array<{ id: number }>;
+  for (const { id } of rows) {
+    const view = getMatchView(id);
+    if (!view) continue;
+    const channel = await ensureMatchChannel(client, view);
+    if (!channel) continue;
+    const team = view.team1_name ?? view.team2_name;
+    const feeder = feederFor(view);
+    const waitingOn = !feeder ? 'your opponent'
+      : feeder.team1_id !== null && feeder.team2_id !== null ? `**${feeder.team1_name} vs ${feeder.team2_name}** (match #${feeder.id})`
+      : `the winner of match #${feeder.id}`;
+    await channel.send({
+      content: discordPlayers(view.team1_id ?? view.team2_id).map(u => `<@${u}>`).join(' ') || undefined,
+      embeds: [notice(`⏳ ${team} — waiting for your next match`,
+        `You’re through to match #${view.id}. Waiting for ${waitingOn} to finish.\nYou’ll get your arena here the moment your opponent is decided — no need to do anything.`, Colors.info)]
+    }).catch(() => null);
+  }
+}
+
+export async function announceEvents(client: Client, events: ReadyEvent[], opts: { casters?: boolean } = {}): Promise<void> {
   for (const event of events) {
     const view = getMatchView(event.matchId);
     if (!view) continue;
     const one = getTeamById(view.team1_id!), two = getTeamById(view.team2_id!);
     if (event.queued) {
       const text = `**${view.team1_name}** vs **${view.team2_name}** in **${view.tournament_name}** is ready, but every arena is busy. You’ll get another DM the moment one opens — no need to do anything.`;
-      for (const team of [one, two]) if (team) await dm(client, team.captainId, { embeds: [notice(`Match #${view.id} is waiting for an arena`, text, Colors.warning)] });
+      for (const userId of discordPlayers(view.team1_id, view.team2_id)) await dm(client, userId, { embeds: [notice(`Match #${view.id} is waiting for an arena`, text, Colors.warning)] });
       await logEvent(client, 'Match waiting for an arena', `Match #${view.id} (**${view.team1_name}** vs **${view.team2_name}**) has no free arena. Add more with \`/arena seed\`, or finish/delete whatever is using them (\`/arena list\`).`, Colors.warning);
       continue;
     }
@@ -130,22 +217,91 @@ export async function announceEvents(client: Client, events: ReadyEvent[]): Prom
       ? `\n🏟️ **Arena: ${event.arenaName}** — everyone on both rosters has been whitelisted, so only you two teams can get in.`
       : '';
     const failLine = event.failures.length
-      ? `\n⚠️ Couldn’t whitelist: ${event.failures.map(f => `<@${f.userId}> (${f.metaUsername}) — ${f.reason}`).join('; ')}`
+      ? `\n⚠️ Couldn’t whitelist: ${event.failures.map(f => `${who(f.userId)} (${f.metaUsername}) — ${f.reason}`).join('; ')}`
       : '';
     for (const [mine, theirs] of [[one, two], [two, one]] as const) {
       if (!mine || !theirs) continue;
-      await dm(client, mine.captainId, { embeds: [notice(
+      for (const userId of discordPlayers(mine.id)) await dm(client, userId, { embeds: [notice(
         `Match #${view.id} is ready`,
         `**${mine.name}** vs **${theirs.name}** in **${view.tournament_name}** — ${view.best_of === 1 ? 'one game' : `best of ${view.best_of} (first to ${needed} wins)`}.`
         + `${arenaLine}\nTheir captain is <@${theirs.captainId}>. Scores are tracked automatically.${failLine}`,
         event.failures.length ? Colors.warning : Colors.success)] });
     }
+    for (const f of event.failures) {
+      await dm(client, f.userId, { embeds: [notice('⚠️ Check your Meta username', `You couldn’t be whitelisted into ${event.arenaName ? `**${event.arenaName}**` : 'your arena'} for match #${view.id} (**${view.team1_name}** vs **${view.team2_name}**): `
+        + `there’s no Orion Drift account called **${f.metaUsername}**.\nMake sure your Meta username is exactly right. If you can’t get into the arena, fix it with \`/player edit meta_username:<your exact Meta username>\` and you’ll be let in automatically within a minute.`, Colors.warning)] });
+    }
     if (event.arenaName) {
-      await createMatchThread(client, view, event.arenaName);
+      await postMatchStart(client, view, event.arenaName);
+      if (opts.casters !== false) await pingCasters(client, view.guild_id, `🎙️ Match #${view.id} is starting — ${view.team1_name} vs ${view.team2_name}`, matchBrief(view, event.arenaName));
       await logEvent(client, 'Arena assigned', `Match #${view.id} (**${view.team1_name}** vs **${view.team2_name}**) → **${event.arenaName}**.${failLine}`,
         event.failures.length ? Colors.warning : Colors.info);
     }
   }
+}
+
+// ---- Casters ---------------------------------------------------------------
+
+let casterListWarned = false;
+
+/** Everyone with the caster role. Listing members needs the Server Members intent switched on in the Developer Portal. */
+async function casterIds(client: Client, guildId: string, roleId: string): Promise<string[]> {
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  const ids: string[] = [];
+  try {
+    for (let after = '0'; guild;) {
+      const page = await guild.members.list({ limit: 1000, after });
+      for (const m of page.values()) if (m.roles.cache.has(roleId)) ids.push(m.id);
+      if (page.size < 1000) break;
+      after = page.lastKey()!;
+    }
+  } catch (error) {
+    if (!casterListWarned) {
+      casterListWarned = true;
+      await logEvent(client, 'Can’t DM casters', 'I can’t list who has the caster role. Turn on **Server Members Intent** for the bot in the Discord Developer Portal (Bot tab). Until then casters only get the channel ping, if one is set.', Colors.warning);
+    }
+    console.error('[casters]', error instanceof Error ? error.message : error);
+  }
+  return ids;
+}
+
+/** DMs everyone with the caster role, and pings the role in the caster channel if one is set. Does nothing until `/settings casters` is set. */
+export async function pingCasters(client: Client, guildId: string, title: string, text: string): Promise<void> {
+  const roleId = casterRoleId();
+  if (!roleId) return;
+  const embed = notice(title, text.slice(0, 4000), Colors.info);
+  for (const id of await casterIds(client, guildId, roleId)) await dm(client, id, { embeds: [embed] });
+  const channel = await channelOf(client, casterChannelId());
+  await channel?.send({ content: `<@&${roleId}>`, embeds: [embed], allowedMentions: { roles: [roleId] } }).catch(() => null);
+}
+
+/** Sent to casters when the bracket is built: every first match with its arena, plus byes. */
+export function castersSchedule(tournament: Tournament): string {
+  const matches = listMatchViews(tournament.id);
+  const playing = matches.filter(m => m.status === 'READY').map(m => `\`#${m.id}\` **${m.team1_name}** vs **${m.team2_name}** — ${m.arena_name ? `🏟️ ${m.arena_name}` : 'waiting for a free arena'}`);
+  const byes = matches.filter(m => m.bracket === 'W' && m.round === 1 && isByeMatch(m) && m.winner_id !== null).map(m => `**${getTeamById(m.winner_id!)?.name}**`);
+  return `**${tournament.name}** started <t:${Math.floor(Date.now() / 1000)}:t> • ${tournament.bestOf === 1 ? 'one game per match' : `best of ${tournament.bestOf}`}`
+    + `\n\n**Playing now**\n${playing.join('\n') || '—'}${byes.length ? `\n\n**Byes (straight to round 2):** ${byes.join(', ')}` : ''}`
+    + `\n\nYou’ll get a DM as each later match starts, with its round, arena and rosters.\n📊 ${bracketLink(tournament.id, tournament.guildId)}`;
+}
+
+function rosterLines(teamId: number | null): string {
+  if (teamId === null) return 'TBD';
+  const team = getTeamById(teamId);
+  return getMembers(teamId).map(m => `${m.userId === team?.captainId ? '👑' : '•'} ${m.metaUsername ?? '(no Meta username)'}${onDiscord(m.userId) ? ` (<@${m.userId}>)` : ''}`).join('\n') || '*no players*';
+}
+
+function bracketLink(tournamentId: number, guildId: string): string {
+  const t = db.prepare('SELECT channel_id AS c, bracket_message_id AS m FROM tournaments WHERE id = ?').get(tournamentId) as { c: string | null; m: string | null } | undefined;
+  return t?.c && t.m ? `[Live bracket](https://discord.com/channels/${guildId}/${t.c}/${t.m})` : '`/tournament bracket`';
+}
+
+/** Everything a caster needs: tournament, round, arena, format, both rosters, where the bracket is. */
+export function matchBrief(view: MatchView, arenaName: string): string {
+  const startedAt = `<t:${Math.floor(Date.now() / 1000)}:t>`;
+  const maxRound = (db.prepare('SELECT MAX(round) AS r FROM matches WHERE tournament_id = ? AND bracket = ?').get(view.tournament_id, view.bracket) as { r: number }).r;
+  return `**${view.tournament_name}** — ${roundTitle(view, view.format, maxRound)}\n🏟️ **Arena:** ${arenaName}\n🕒 **Starting:** ${startedAt}\n🎮 ${view.best_of === 1 ? 'One game' : `Best of ${view.best_of} (first to ${winsNeeded(view.best_of)})`}`
+    + `\n\n**${view.team1_name}**\n${rosterLines(view.team1_id)}\n\n**${view.team2_name}**\n${rosterLines(view.team2_id)}\n\n📊 ${bracketLink(view.tournament_id, view.guild_id)}`;
 }
 
 // ---- Automatic scoring ----------------------------------------------------
@@ -248,8 +404,8 @@ async function archiveFinishedThreads(client: Client): Promise<void> {
 }
 
 /**
- * Deletes the tournament role (once) and archives any threads still open.
- * With `destroy` (tournament being deleted) the threads and the live bracket message are deleted instead.
+ * Deletes the tournament role (once) and the match channels (old-style threads are archived).
+ * With `destroy` (tournament being deleted) the live bracket message is deleted too.
  */
 export async function cleanupTournament(client: Client, tournamentId: number, destroy = false): Promise<void> {
   const t = db.prepare('SELECT guild_id AS guildId, role_id AS roleId, channel_id AS channelId, bracket_message_id AS bracketId FROM tournaments WHERE id = ?').get(tournamentId) as
@@ -263,7 +419,7 @@ export async function cleanupTournament(client: Client, tournamentId: number, de
   const threads = db.prepare('SELECT thread_id AS threadId FROM matches WHERE tournament_id = ? AND thread_id IS NOT NULL').all(tournamentId) as Array<{ threadId: string }>;
   for (const { threadId } of threads) {
     const thread = await client.channels.fetch(threadId).catch(() => null);
-    if (destroy) await thread?.delete('Tournament deleted').catch(() => null);
+    if (destroy || (thread && !thread.isThread())) await thread?.delete(destroy ? 'Tournament deleted' : 'Tournament finished').catch(() => null);
     else if (thread?.isThread() && !thread.archived) await thread.setArchived(true).catch(() => null);
   }
   if (destroy && t.channelId && t.bracketId) {
@@ -318,7 +474,7 @@ function matchLine(match: MatchView): string {
     const score = match.score1 !== null ? ` ${match.score1}–${match.score2}` : '';
     return `\`#${match.id}\` ${aWon ? `**${a}**` : `~~${a}~~`} vs ${aWon ? `~~${b}~~` : `**${b}**`}${score}`;
   }
-  if (match.status !== 'READY') return `\`#${match.id}\` ${a} vs ${b}`;
+  if (match.status !== 'READY') return `\`#${match.id}\` ${a} vs ${b}${(match.team1_id === null) !== (match.team2_id === null) ? ' — ⏳ waiting' : ''}`;
   const series = match.best_of > 1 ? ` (${match.team1_wins}–${match.team2_wins})` : '';
   return `\`#${match.id}\` ${a} vs ${b}${series} — ⚔️ ${match.arena_name ? `playing in ${match.arena_name}` : 'ready'}`;
 }
@@ -393,8 +549,8 @@ const REMINDERS = [{ minutes: 60, bit: 1 }, { minutes: 10, bit: 2 }];
 
 /** DMs every player (and posts in the tournament channel) 60 and 10 minutes before a tournament's planned start. */
 export async function sendReminders(client: Client): Promise<void> {
-  const rows = db.prepare("SELECT id, name, channel_id AS channelId, starts_at AS startsAt, reminded FROM tournaments WHERE starts_at IS NOT NULL AND status IN ('SIGNUPS', 'CLOSED')")
-    .all() as Array<{ id: number; name: string; channelId: string | null; startsAt: number; reminded: number }>;
+  const rows = db.prepare("SELECT id, guild_id AS guildId, name, channel_id AS channelId, starts_at AS startsAt, reminded FROM tournaments WHERE starts_at IS NOT NULL AND status IN ('SIGNUPS', 'CLOSED')")
+    .all() as Array<{ id: number; guildId: string; name: string; channelId: string | null; startsAt: number; reminded: number }>;
   for (const t of rows) {
     const minutesLeft = (t.startsAt - Date.now()) / 60_000;
     for (const { minutes, bit } of REMINDERS) {
@@ -405,6 +561,11 @@ export async function sendReminders(client: Client): Promise<void> {
       await (await channelOf(client, t.channelId))?.send({ embeds: [notice('⏰ Tournament reminder', text, Colors.info)] }).catch(() => null);
       const players = db.prepare("SELECT DISTINCT tm.user_id AS id FROM registrations r JOIN team_members tm ON tm.team_id = r.team_id WHERE r.tournament_id = ? AND r.status = 'CONFIRMED'").all(t.id) as Array<{ id: string }>;
       for (const p of players) await dm(client, p.id, { embeds: [notice('⏰ Tournament reminder', text, Colors.info)] });
+      if (minutes === 60) {
+        const teams = db.prepare("SELECT tm.name, tm.id FROM registrations r JOIN teams tm ON tm.id = r.team_id WHERE r.tournament_id = ? AND r.status = 'CONFIRMED' ORDER BY r.seed, r.created_at").all(t.id) as Array<{ name: string; id: number }>;
+        await pingCasters(client, t.guildId, `🎙️ ${t.name} starts in about an hour`,
+          `Starts <t:${Math.floor(t.startsAt / 1000)}:R>. The bracket gets built when it starts; you'll be pinged here as each match begins with its round, arena and rosters.\n\n${teams.map(tm => `**${tm.name}**\n${rosterLines(tm.id)}`).join('\n\n') || '*No teams entered yet.*'}`);
+      }
     }
   }
 }
